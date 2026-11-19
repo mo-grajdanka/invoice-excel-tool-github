@@ -1,31 +1,31 @@
-"""Procurement invoice → existing Excel workbook. Start: streamlit run app.py"""
+"""Procurement invoices → existing Excel workbook. Start: streamlit run app.py"""
 from __future__ import annotations
 
-from datetime import datetime
 from hashlib import sha256
 import hmac
-from io import BytesIO
 import os
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+from batch_writer import append_invoice_batch
 from excel_writer import (
-    SHEET_MAPS, add_items, number, possible_duplicates, read_workbook,
+    SHEET_MAPS, normalize, number, possible_duplicates, read_workbook,
     supported_sheets, workbook_sheet_preview,
 )
 from ocr import DEFAULT_MODEL, parse_invoice_pdf
 from xlsx_patch import last_physical_row
 
+MAX_INVOICES = 8
+MAX_PDF_SIZE = 18 * 1024 * 1024
 
-st.set_page_config(page_title="Счёт → Закупочная ведомость", page_icon="📑", layout="wide")
+st.set_page_config(page_title="Счета → Закупочная ведомость", page_icon="📑", layout="wide")
 st.markdown("""
 <style>
 .block-container {max-width: 1250px; padding-top: 2rem;}
 [data-testid="stMetric"] {border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px;}
 [data-testid="stFileUploader"] {border-radius: 14px;}
-.step-note {color:#64748b; font-size: .93rem;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -38,39 +38,54 @@ def secret(name: str, default: str = "") -> str:
 
 
 def pdf_quality(pdf_bytes: bytes) -> tuple[int, str]:
-    """Return page count and proposed OCR engine without sending data anywhere."""
+    """Check PDF locally and recommend the parser; no API billing."""
     import fitz
+    if len(pdf_bytes) > MAX_PDF_SIZE:
+        raise ValueError("PDF слишком большой (максимум 18 МБ на счёт)")
     try:
         with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
             if len(document) == 0:
                 raise ValueError("PDF не содержит страниц")
             if len(document) > 8:
-                raise ValueError("Для первой версии поддерживаются счета до 8 страниц")
+                raise ValueError("Поддерживается максимум 8 страниц в одном PDF-счёте")
             sample_text = "".join(page.get_text("text") for page in document)
             return len(document), ("mistral-ocr" if len(sample_text.strip()) < 100 else "cloudflare-ai")
     except ValueError:
         raise
     except Exception as exc:
-        raise ValueError("Не удалось открыть PDF. Возможно, файл повреждён или защищён паролем.") from exc
+        raise ValueError("Не удалось открыть PDF. Возможно, он повреждён или защищён паролем.") from exc
 
 
-def session_reset_if_changed(signature: str) -> None:
-    if st.session_state.get("file_signature") != signature:
-        st.session_state["file_signature"] = signature
-        st.session_state.pop("draft", None)
-        for key in ("meta_supplier", "meta_invoice", "meta_date", "meta_purpose"):
-            st.session_state.pop(key, None)
+def file_fingerprint(filename: str, content: bytes, position: int) -> str:
+    return f"pdf_{position}_{sha256(content).hexdigest()[:16]}"
 
 
-def install_draft(draft: dict) -> None:
-    st.session_state["draft"] = draft
-    st.session_state["meta_supplier"] = draft.get("supplier", "")
-    st.session_state["meta_invoice"] = draft.get("invoice_number", "")
-    st.session_state["meta_date"] = draft.get("invoice_date", "")
-    st.session_state["meta_purpose"] = ""
+def reset_if_uploads_changed(xlsx_bytes: bytes | None, pdf_files: list) -> None:
+    h = sha256(xlsx_bytes or b"")
+    for file in pdf_files:
+        h.update(file.name.encode("utf-8"))
+        h.update(file.getvalue())
+    signature = h.hexdigest()
+    if st.session_state.get("uploads_signature") != signature:
+        st.session_state["uploads_signature"] = signature
+        st.session_state["documents"] = []
+        st.session_state["parse_errors"] = []
+        st.session_state["editor_revision"] = st.session_state.get("editor_revision", 0) + 1
 
 
-st.title("📑 Счёт → Закупочная ведомость")
+def add_document(doc_id: str, filename: str, parsed: dict) -> dict:
+    """Attach per-invoice editable metadata before Streamlit widgets are created."""
+    for field, value in (
+        ("supplier", parsed.get("supplier", "")),
+        ("invoice", parsed.get("invoice_number", "")),
+        ("date", parsed.get("invoice_date", "")),
+        ("purpose", ""),
+    ):
+        st.session_state[f"{field}_{doc_id}"] = value or ""
+    return {"id": doc_id, "filename": filename, "parsed": parsed}
+
+
+st.title("📑 Счета → Закупочная ведомость")
 app_password = secret("APP_PASSWORD")
 if app_password:
     entered = st.text_input("Пароль доступа к приложению", type="password", key="access_password")
@@ -78,195 +93,234 @@ if app_password:
         st.info("Для работы с ведомостью введите пароль доступа.")
         st.stop()
 else:
-    st.caption("Приложение не защищено паролем. Для общедоступного размещения установите APP_PASSWORD в Secrets.")
-st.write("Добавляйте позиции из PDF-счёта в существующий Excel-файл, сохраняя другие листы и их данные.")
+    st.warning("Приложение не защищено паролем. Установите APP_PASSWORD в Secrets перед предоставлением ссылки коллегам.")
+
+st.write("Загрузите текущий Excel и до 8 PDF-счетов. Проверьте позиции, выберите лист для каждого счёта и скачайте один обновлённый Excel.")
 
 c1, c2 = st.columns(2, gap="large")
 with c1:
     st.subheader("1. Excel-ведомость")
     xlsx_file = st.file_uploader("Загрузите текущий файл .xlsx", type=["xlsx"], key="xlsx")
 with c2:
-    st.subheader("2. PDF-счёт")
-    pdf_file = st.file_uploader("Загрузите счёт .pdf", type=["pdf"], key="pdf")
+    st.subheader("2. PDF-счета — до 8 файлов")
+    pdf_files = st.file_uploader(
+        "Загрузите один или несколько счетов .pdf", type=["pdf"],
+        accept_multiple_files=True, key="pdfs",
+    ) or []
+    st.caption(f"Выбрано файлов: {len(pdf_files)} / {MAX_INVOICES}. Каждый PDF — до 8 страниц и 18 МБ.")
+
+if len(pdf_files) > MAX_INVOICES:
+    st.error("Выбрано более 8 PDF. Удалите лишние файлы из загрузки.")
+    st.stop()
 
 xlsx_bytes = xlsx_file.getvalue() if xlsx_file else None
-pdf_bytes = pdf_file.getvalue() if pdf_file else None
-signature = sha256((xlsx_bytes or b"") + (pdf_bytes or b"")).hexdigest()
-session_reset_if_changed(signature)
+reset_if_uploads_changed(xlsx_bytes, pdf_files)
 
-if xlsx_file and xlsx_bytes:
-    try:
-        wb = read_workbook(xlsx_bytes)
-        sheets = supported_sheets(wb)
-    except Exception:
-        st.error("Не удалось прочитать Excel. Убедитесь, что это корректный файл .xlsx.")
-        st.stop()
-    if not sheets:
-        st.error("Файл не содержит поддерживаемых листов. Приложение настроено на конкретный шаблон ведомости.")
-        st.stop()
-    st.success(f"Excel загружен · {len(wb.sheetnames)} листов · настроено для записи: {len(sheets)}")
-    st.subheader("3. Куда добавлять позиции")
-    selected_sheet = st.selectbox("Выберите лист ведомости", sheets)
-    mapping = SHEET_MAPS[selected_sheet]
-    if mapping.caveat:
-        st.info(mapping.caveat)
-    with st.expander("Показать последние позиции выбранного листа"):
-        st.dataframe(workbook_sheet_preview(wb, selected_sheet), hide_index=True, use_container_width=True)
-        st.caption(f"Новые позиции будут добавлены после текущей последней строки ({last_physical_row(xlsx_bytes, selected_sheet)}), без замены заполненных ячеек.")
-else:
-    st.info("Начните с загрузки Excel-файла. Можно сначала попробовать без PDF: позиции разрешается ввести вручную.")
+if not xlsx_bytes:
+    st.info("Сначала загрузите Excel-файл. Если PDF нет, можно добавить позиции вручную.")
     st.stop()
+try:
+    wb = read_workbook(xlsx_bytes)
+    sheets = supported_sheets(wb)
+except Exception:
+    st.error("Не удалось прочитать Excel. Проверьте формат .xlsx.")
+    st.stop()
+if not sheets:
+    st.error("В файле нет поддерживаемых листов. Приложение настроено на определённый шаблон ведомости.")
+    st.stop()
+st.success(f"Excel загружен · всего листов: {len(wb.sheetnames)} · поддерживаются: {len(sheets)}")
+with st.expander("Посмотреть последние записи и место добавления"):
+    preview_sheet = st.selectbox("Лист для просмотра", sheets, key="preview_sheet")
+    st.dataframe(workbook_sheet_preview(wb, preview_sheet), hide_index=True, use_container_width=True)
+    st.caption(f"Добавление начинается после последней строки: {last_physical_row(xlsx_bytes, preview_sheet)}.")
 
-st.subheader("4. Распознать и проверить позиции")
+st.subheader("3. Распознавание")
 key = secret("OPENROUTER_API_KEY")
 model = secret("OPENROUTER_MODEL", DEFAULT_MODEL)
-mode_map = {"Автоматически": "auto", "Текстовый PDF (без дополнительного OCR)": "cloudflare-ai", "Скан / фото в PDF (OCR)": "mistral-ocr"}
-
-left, right = st.columns([3, 2])
+mode_map = {"Автоматически": "auto", "Текстовый PDF": "cloudflare-ai", "Скан / фото в PDF": "mistral-ocr"}
+left, right = st.columns([2, 3])
 with left:
-    pdf_mode = st.selectbox("Режим распознавания", list(mode_map))
+    pdf_mode = st.selectbox("Режим обработки PDF", list(mode_map))
 with right:
-    st.caption("Автоматический разбор — через OpenRouter. Для сканов доступен OCR; он может оплачиваться отдельно.")
+    st.caption("Все выбранные PDF распознаются последовательно через OpenRouter. Каждый документ может расходовать баланс API. Повторное нажатие запускает распознавание повторно.")
 
-cc1, cc2 = st.columns([1, 1])
-with cc1:
-    parse_clicked = st.button("✨ Распознать PDF", type="primary", use_container_width=True, disabled=(not bool(pdf_bytes) or not bool(key)))
-with cc2:
-    manual_clicked = st.button("✏️ Ввести позиции вручную", use_container_width=True)
-
+button1, button2 = st.columns(2)
+with button1:
+    parse_clicked = st.button(
+        "✨ Распознать выбранные PDF", type="primary", use_container_width=True,
+        disabled=(not pdf_files or not key),
+    )
+with button2:
+    manual_clicked = st.button("✏️ Добавить счёт вручную", use_container_width=True)
 if not key:
-    st.warning("Для автоматического разбора добавьте **OPENROUTER_API_KEY** в Secrets вашего Streamlit-приложения. Ручное заполнение работает без API.")
-if pdf_file and len(pdf_bytes) > 18 * 1024 * 1024:
-    st.error("PDF слишком большой (максимум 18 МБ).")
+    st.warning("Для распознавания добавьте OPENROUTER_API_KEY в Streamlit Secrets. Ручной ввод доступен без API.")
 
 if manual_clicked:
-    install_draft({
-        "supplier": "", "invoice_number": "", "invoice_date": "", "invoice_total": None,
-        "items": [{"include": True, "name": "", "unit": "шт", "quantity": 1.0,
-                   "unit_price": 0.0, "amount": 0.0}],
-        "warnings": ["Ручной ввод: проверьте значения перед скачиванием."],
-    })
+    documents = st.session_state.get("documents", [])
+    if len(documents) >= MAX_INVOICES:
+        st.error("Можно подготовить не более 8 счетов за одну операцию.")
+    else:
+        next_id = f"manual_{st.session_state.get('manual_serial', 0) + 1}"
+        st.session_state["manual_serial"] = st.session_state.get("manual_serial", 0) + 1
+        documents.append(add_document(next_id, "Ручной ввод", {
+            "supplier": "", "invoice_number": "", "invoice_date": "", "invoice_total": None,
+            "items": [{"include": True, "name": "", "unit": "шт", "quantity": 1.0,
+                       "unit_price": 0.0, "amount": 0.0}],
+            "warnings": ["Ручной ввод: проверьте все значения."],
+        }))
+        st.session_state["documents"] = documents
 
 if parse_clicked:
-    try:
-        count, recommended = pdf_quality(pdf_bytes)
-        engine = recommended if mode_map[pdf_mode] == "auto" else mode_map[pdf_mode]
-        with st.spinner(f"Анализ PDF ({count} стр., режим: {engine})…"):
-            parsed = parse_invoice_pdf(pdf_bytes, pdf_file.name, key, model=model, engine=engine)
-        if not parsed["items"]:
-            st.warning("В счёте не удалось уверенно найти позиции. Проверьте файл или добавьте строки вручную.")
-        else:
-            install_draft(parsed)
-            st.success(f"Найдено {len(parsed['items'])} позиций. Проверьте данные ниже.")
-    except Exception as exc:
-        st.error(str(exc))
+    # Validate the whole batch locally before any paid API requests.
+    checks = []
+    validation_errors = []
+    seen_hashes = set()
+    for index, file in enumerate(pdf_files):
+        pdf_bytes = file.getvalue()
+        digest = sha256(pdf_bytes).hexdigest()
+        if digest in seen_hashes:
+            validation_errors.append(f"{file.name}: одинаковый PDF загружен дважды")
+            continue
+        seen_hashes.add(digest)
+        try:
+            pages, engine = pdf_quality(pdf_bytes)
+            checks.append((index, file, pdf_bytes, pages, engine))
+        except ValueError as exc:
+            validation_errors.append(f"{file.name}: {exc}")
+    if validation_errors:
+        st.session_state["parse_errors"] = validation_errors
+        st.error("Проверьте выбранные PDF. API-запросы не выполнялись.")
+    else:
+        st.session_state["parse_errors"] = []
+        new_docs = []
+        progress = st.progress(0, text="Начало распознавания…")
+        for completed, (index, file, pdf_bytes, pages, recommended) in enumerate(checks, 1):
+            engine = recommended if mode_map[pdf_mode] == "auto" else mode_map[pdf_mode]
+            try:
+                with st.spinner(f"Счёт {completed}/{len(checks)}: {file.name} ({pages} стр.)…"):
+                    parsed = parse_invoice_pdf(pdf_bytes, file.name, key, model=model, engine=engine)
+                new_docs.append(add_document(file_fingerprint(file.name, pdf_bytes, index), file.name, parsed))
+                if not parsed.get("items"):
+                    st.session_state["parse_errors"].append(
+                        f"{file.name}: позиции не найдены; при необходимости добавьте их вручную в таблицу.")
+            except Exception as exc:
+                st.session_state["parse_errors"].append(f"{file.name}: {exc}")
+            progress.progress(completed / len(checks), text=f"Обработано: {completed}/{len(checks)}")
+        st.session_state["documents"] = new_docs
+        st.session_state["editor_revision"] = st.session_state.get("editor_revision", 0) + 1
+        if new_docs:
+            st.success(f"Распознано счетов: {len(new_docs)} из {len(checks)}. Проверьте данные каждого.")
 
-if "draft" not in st.session_state:
-    st.caption("После распознавания появится редактируемая таблица. Вы сможете удалить ненужные строки, добавить свои и изменить числа.")
+for err in st.session_state.get("parse_errors", []):
+    st.warning(err)
+
+documents = st.session_state.get("documents", [])
+if not documents:
+    st.info("После распознавания появятся отдельные редактируемые таблицы для каждого счёта.")
     st.stop()
 
-draft = st.session_state["draft"]
-if draft.get("warnings"):
-    for warning in draft["warnings"][:5]:
-        st.warning(warning)
+st.subheader("4. Проверка позиций и выбор листов")
+st.caption("Для каждого счёта выберите лист отдельно. Можно исправить значения и исключить ненужные строки.")
+prepared = []
+batch_seen = set()
+for index, doc in enumerate(documents, 1):
+    doc_id, parsed = doc["id"], doc["parsed"]
+    label = f"Счёт {index} из {len(documents)} · {doc['filename']} · {len(parsed.get('items', []))} позиций"
+    with st.expander(label, expanded=(len(documents) == 1 or index == 1)):
+        sh = st.selectbox("Записать на лист", sheets, key=f"sheet_{doc_id}")
+        mapping = SHEET_MAPS[sh]
+        if mapping.caveat:
+            st.info(mapping.caveat)
+        for warn in parsed.get("warnings", [])[:5]:
+            st.warning(str(warn))
+        m1, m2 = st.columns(2)
+        with m1:
+            supplier = st.text_input("Поставщик", key=f"supplier_{doc_id}")
+            invoice = st.text_input("Номер счёта", key=f"invoice_{doc_id}")
+        with m2:
+            invoice_date = st.text_input("Дата счёта (ДД.ММ.ГГГГ)", key=f"date_{doc_id}")
+            purpose = st.text_input("Назначение / объект (при необходимости)", key=f"purpose_{doc_id}")
+        status = ""
+        if mapping.status_col:
+            status = st.selectbox("Статус оплаты", ["не оплачено", "оплачено", "часть аванс"], key=f"status_{doc_id}")
 
-with st.container(border=True):
-    mc1, mc2 = st.columns(2)
-    with mc1:
-        supplier = st.text_input("Поставщик", key="meta_supplier")
-        invoice = st.text_input("Номер счёта", key="meta_invoice")
-    with mc2:
-        invoice_date = st.text_input("Дата счёта (ДД.ММ.ГГГГ)", key="meta_date")
-        purpose = st.text_input("Назначение / объект (если применимо)", key="meta_purpose")
-
-    status = ""
-    if mapping.status_col:
-        status = st.selectbox("Статус оплаты", ["не оплачено", "оплачено", "часть аванс"], index=0)
-
-    rows = []
-    for item in draft["items"]:
-        row = dict(item)
-        for col in ("quantity", "unit_price", "amount"):
-            try:
-                row[col] = number(row.get(col))
-            except ValueError:
-                row[col] = None
-        rows.append(row)
-    editable = pd.DataFrame(rows, columns=["include", "name", "unit", "quantity", "unit_price", "amount"])
-    editable["include"] = editable["include"].fillna(True).astype(bool)
-    st.write("**Позиции счёта — все значения можно исправить**")
-    edited = st.data_editor(
-        editable, num_rows="dynamic", hide_index=True, use_container_width=True,
-        column_config={
-            "include": st.column_config.CheckboxColumn("Добавить", help="Снимите галочку, чтобы пропустить строку"),
-            "name": st.column_config.TextColumn("Наименование", width="large", required=True),
-            "unit": st.column_config.TextColumn("Ед. изм.", width="small"),
-            "quantity": st.column_config.NumberColumn("Количество", min_value=0.0, format="%.4f"),
-            "unit_price": st.column_config.NumberColumn("Цена", min_value=0.0, format="%.2f"),
-            "amount": st.column_config.NumberColumn("Стоимость", min_value=0.0, format="%.2f"),
-        },
-        key=f"editor_{signature}_{selected_sheet}_{sha256(str(draft).encode()).hexdigest()[:10]}",
-    )
-
-lines = edited.where(pd.notnull(edited), None).to_dict("records")
-lines = [dict(row, include=(False if row.get("include") is False else bool(row.get("include", True)))) for row in lines]
-selected = [row for row in lines if row.get("include")]
-
-if selected:
-    total = 0.0
-    for row in selected:
-        try:
-            val = number(row.get("amount"))
-            if val is None:
-                q, p = number(row.get("quantity")), number(row.get("unit_price"))
-                val = (q or 0) * (p or 0)
-            total += val
-        except ValueError:
-            pass
-    a, b, c = st.columns(3)
-    a.metric("Выбрано позиций", len(selected))
-    b.metric("Сумма выбранных", f"{total:,.2f} ₽".replace(",", " "))
-    if draft.get("invoice_total") is not None:
-        c.metric("Итого в счёте", f"{draft['invoice_total']} ₽")
-
-    mismatches = []
-    for row in selected:
-        try:
-            q, p, s = [number(row.get(v)) for v in ("quantity", "unit_price", "amount")]
-            if q is not None and p is not None and s is not None and abs(q * p - s) > max(1.0, .02 * abs(s)):
-                mismatches.append(str(row.get("name", ""))[:65])
-        except ValueError:
+        rows = []
+        for item in parsed.get("items", []):
+            row = dict(item)
+            for col in ("quantity", "unit_price", "amount"):
+                try:
+                    row[col] = number(row.get(col))
+                except ValueError:
+                    row[col] = None
+            rows.append(row)
+        editable = pd.DataFrame(rows, columns=["include", "name", "unit", "quantity", "unit_price", "amount"])
+        if editable.empty:
+            editable = pd.DataFrame([{"include": False, "name": "", "unit": "шт", "quantity": None,
+                                      "unit_price": None, "amount": None}])
+        editable["include"] = editable["include"].fillna(False).astype(bool)
+        edited = st.data_editor(
+            editable, num_rows="dynamic", hide_index=True, use_container_width=True,
+            column_config={
+                "include": st.column_config.CheckboxColumn("Добавить", help="Снимите галочку, чтобы исключить позицию"),
+                "name": st.column_config.TextColumn("Наименование", width="large"),
+                "unit": st.column_config.TextColumn("Ед. изм.", width="small"),
+                "quantity": st.column_config.NumberColumn("Количество", min_value=0.0, format="%.4f"),
+                "unit_price": st.column_config.NumberColumn("Цена", min_value=0.0, format="%.2f"),
+                "amount": st.column_config.NumberColumn("Стоимость", min_value=0.0, format="%.2f"),
+            },
+            key=f"editor_{doc_id}_{st.session_state.get('editor_revision', 0)}",
+        )
+        lines = edited.where(pd.notnull(edited), None).to_dict("records")
+        chosen = [dict(row) for row in lines if row.get("include") is True or row.get("include") == True]
+        if not chosen:
+            st.caption("Нет выбранных строк — этот счёт не попадёт в Excel.")
             continue
-    if mismatches:
-        st.warning("Стоимость отличается от количества × цены в позициях: " + ", ".join(mismatches[:4]) + ". Проверьте скидки, НДС и округление.")
+        total = 0.0
+        bad_math = []
+        for row in chosen:
+            q, p, amount = (number(row.get(col)) for col in ("quantity", "unit_price", "amount"))
+            total += (amount if amount is not None else (q or 0) * (p or 0))
+            if all(v is not None for v in (q, p, amount)) and abs(q * p - amount) > max(1.0, 0.02 * abs(amount)):
+                bad_math.append(str(row.get("name") or "")[:60])
+            duplicate_key = (sh, normalize(invoice), normalize(supplier), normalize(row.get("name")), q, p)
+            if duplicate_key in batch_seen:
+                st.warning(f"Похожая позиция встречается в нескольких выбранных счетах: {row.get('name', '')}")
+            batch_seen.add(duplicate_key)
+        a, b = st.columns(2)
+        a.metric("Позиций к добавлению", len(chosen))
+        b.metric("Сумма выбранных", f"{total:,.2f} ₽".replace(",", " "))
+        if bad_math:
+            st.warning("Проверьте количество × цену: " + ", ".join(bad_math[:4]))
+        try:
+            duplicates = possible_duplicates(wb, sh, chosen, supplier, invoice)
+            if any(duplicates):
+                st.warning("Похожая позиция уже есть в Excel: " + ", ".join(
+                    str(row.get("name"))[:65] for row, flag in zip(chosen, duplicates) if flag)[:300])
+        except Exception:
+            st.caption("Проверка дублей в Excel недоступна; проверьте позиции вручную.")
+        prepared.append({"sheet": sh, "lines": chosen, "supplier": supplier, "invoice": invoice,
+                         "invoice_date": invoice_date, "purpose": purpose, "status": status,
+                         "pdf_filename": doc["filename"]})
 
-    try:
-        duplicates = possible_duplicates(wb, selected_sheet, selected, supplier, invoice)
-        if any(duplicates):
-            st.warning("В листе уже есть похожие позиции. Проверьте повторную загрузку: " + ", ".join(
-                str(line.get("name"))[:70] for line, dup in zip(selected, duplicates) if dup)[:400])
-    except Exception:
-        st.caption("Не удалось выполнить проверку возможных дублей; проверьте строки вручную.")
-
+st.subheader("5. Скачать результат")
+if not prepared:
+    st.info("Отметьте хотя бы одну позицию в счёте, чтобы сформировать Excel.")
+    st.stop()
 try:
-    output_bytes, new_rows = add_items(
-        xlsx_bytes, selected_sheet, lines,
-        supplier=supplier, invoice=invoice, invoice_date=invoice_date,
-        purpose=purpose, status=status,
-        pdf_filename=pdf_file.name if pdf_file else "",
-    )
-    stem = Path(xlsx_file.name).stem
-    output_name = f"{stem}_обновлено.xlsx"
-    st.success(f"Готово к скачиванию: добавится {len(new_rows)} позиций на лист «{selected_sheet}», строки {new_rows[0]}–{new_rows[-1]}.")
+    updated, report = append_invoice_batch(xlsx_bytes, prepared)
+    lines_count = sum(len(entry["rows"]) for entry in report)
+    st.success(f"Готово: {len(report)} счетов · {lines_count} позиций · {len(set(entry['sheet'] for entry in report))} листов. Один Excel-файл.")
+    for entry in report:
+        st.caption(f"{entry['pdf_filename']} → {entry['sheet']}: строки {entry['rows'][0]}–{entry['rows'][-1]}")
     st.download_button(
-        "⬇️ Скачать обновлённый Excel", output_bytes,
-        file_name=output_name,
+        "⬇️ Скачать обновлённый Excel", data=updated,
+        file_name=f"{Path(xlsx_file.name).stem}_обновлено.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary", use_container_width=True,
     )
-    st.caption("Исходный файл не меняется. Скачайте новую копию и при следующем счёте загрузите именно её.")
+    st.caption("Исходный Excel не изменён. Для следующей партии загрузите скачанную обновлённую копию.")
 except Exception as exc:
-    st.error(f"Пока нельзя сформировать файл: {exc}")
+    st.error(f"Не удалось сформировать Excel: {exc}")
 
 st.divider()
-st.caption("Конфиденциальность: Excel обрабатывается внутри приложения. При автоматическом распознавании PDF передаётся в OpenRouter/провайдер модели. В этой версии нет базы данных и автоматической отправки файлов в GitHub.")
+st.caption("Конфиденциальность: Excel обрабатывается в памяти приложения. Для AI-распознавания PDF передаются через OpenRouter. Файлы не отправляются в GitHub.")
